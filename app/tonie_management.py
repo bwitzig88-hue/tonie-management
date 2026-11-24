@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Tonie Management – geschrieben von Claude (KI-Assistent von Anthropic). Lizenz: MIT, siehe LICENSE.
-# Inoffiziell, nicht von der Boxine GmbH (tonies®). Nutzt die inoffizielle Bibliothek „tonie-api“.
+# Inoffiziell, nicht von der Boxine GmbH (tonies®). Spricht die inoffizielle tonies-Cloud-Schnittstelle an (tonie_cloud.py).
 """Tonie Management: bespielt Kreativ-Tonies abends automatisch mit der nächsten Hörspielfolge aus einem Ordner.
 Mehrere Kreativ-Tonies: jeder hat seinen eigenen Ordner, Plan, Uhrzeit und Verlauf.
 Weboberfläche (Port 8095): Tonie auswählen, sehen was drauf ist, Plan ändern, aussetzen, pausieren.
@@ -21,6 +21,7 @@ import datetime as dt
 import json
 import os
 import random
+import re
 import sys
 import threading
 import time
@@ -38,6 +39,8 @@ MAX_MIN = float(os.environ.get("MAX_MINUTEN", "89"))       # Kreativ-Tonie fasst
 AUDIO = (".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".flac", ".m4b")
 HAUPT = "/"                                                # Folgen direkt im Hauptordner
 CLOUD_ALLE_STUNDEN = 6
+MAX_FEHLVERSUCHE = int(os.environ.get("MAX_FEHLVERSUCHE", "3"))   # danach wird eine Folge ausgesetzt
+STANDARD_UHRZEIT = "17:30"
 LOCK = threading.RLock()
 RUN = {"busy": None, "msg": ""}                            # busy = ID des Tonies, der gerade bespielt wird
 CLOUD = {"fehler": None}
@@ -45,6 +48,21 @@ CLOUD = {"fehler": None}
 
 def log(msg):
     print(time.strftime("[%d.%m.%Y %H:%M:%S] ") + msg, flush=True)
+
+
+def uhrzeit_pruefen(s):
+    """'7:05' wird zu '07:05'. Wirft ValueError bei allem, was keine gültige Uhrzeit ist."""
+    m = re.fullmatch(r"\s*(\d{1,2}):(\d{2})\s*", str(s or ""))
+    if not m or int(m[1]) > 23 or int(m[2]) > 59:
+        raise ValueError(f"Ungültige Uhrzeit „{s}“ – bitte im Format HH:MM (00:00 bis 23:59).")
+    return f"{int(m[1]):02d}:{int(m[2]):02d}"
+
+
+def _start_uhrzeit():
+    try:
+        return uhrzeit_pruefen(os.environ.get("UHRZEIT", STANDARD_UHRZEIT))
+    except ValueError:
+        return STANDARD_UHRZEIT
 
 
 def ordnername(name):
@@ -118,8 +136,9 @@ def folgen(ordner, ausnehmen=()):
 # ---------------------------------------------------------------- Stand
 TONIE = {"name": "", "bild": None, "inhalt": [], "belegt_s": 0, "frei_s": None, "abgerufen": None, "fehlt": False,
          "ordner": None, "aktiv": False, "queue": [], "aus": [], "runde": [], "verlauf": [], "pause_bis": None,
-         "uhrzeit": os.environ.get("UHRZEIT", "17:30"), "modus": os.environ.get("MODUS", "reihenfolge").lower(),
-         "zuletzt": None, "datum": None, "auto": False}
+         "uhrzeit": _start_uhrzeit(), "modus": os.environ.get("MODUS", "reihenfolge").lower(),
+         "zuletzt": None, "datum": None, "auto": False,
+         "fehlversuche": {}}
 PLAN_FELDER = ("queue", "aus", "runde", "verlauf", "pause_bis", "uhrzeit", "modus", "zuletzt", "datum")
 
 
@@ -141,6 +160,11 @@ def laden():
                 t["aktiv"] = False
         for k, v in TONIE.items():
             t.setdefault(k, copy.deepcopy(v))
+        try:
+            t["uhrzeit"] = uhrzeit_pruefen(t["uhrzeit"])
+        except ValueError:
+            log(f"„{t.get('name')}“: ungültige Uhrzeit „{t['uhrzeit']}“ – {STANDARD_UHRZEIT} verwendet.")
+            t["uhrzeit"] = STANDARD_UHRZEIT
     return s
 
 
@@ -198,7 +222,8 @@ def plan(t, fl):
         zu_lang = minuten > MAX_MIN
         defekt = all(dauer(f) <= 0 for f in fl[n])        # leer/abgebrochen kopiert oder nicht lesbar
         row = {"name": n, "dateien": len(fl[n]), "minuten": round(minuten), "aus": n in t["aus"],
-               "zu_lang": zu_lang, "defekt": defekt, "termin": None}
+               "zu_lang": zu_lang, "defekt": defekt, "termin": None,
+               "fehlversuche": t.get("fehlversuche", {}).get(n, 0)}
         if nt and not row["aus"] and not zu_lang and not defekt:
             row["termin"] = nt.date().isoformat()
             d = nt.date() + dt.timedelta(days=1)
@@ -211,11 +236,8 @@ def plan(t, fl):
 
 # ---------------------------------------------------------------- Tonie-Cloud
 def api():
-    from tonie_api.api import TonieAPI
-    user, pw = os.environ.get("TONIES_USER"), os.environ.get("TONIES_PASS")
-    if not user or not pw:
-        raise RuntimeError("TONIES_USER / TONIES_PASS fehlen in der .env-Datei.")
-    return TonieAPI(user, pw)
+    from tonie_cloud import TonieCloud
+    return TonieCloud(os.environ.get("TONIES_USER"), os.environ.get("TONIES_PASS"))
 
 
 def feld(o, *namen):
@@ -238,10 +260,11 @@ def tonie_info(t):
 
 
 def cloud_abrufen(a=None):
-    """Kreativ-Tonies und ihren aktuellen Inhalt aus der Cloud holen."""
+    """Kreativ-Tonies und ihren aktuellen Inhalt aus der Cloud holen.
+    Schlägt der Abruf fehl, bleibt der gespeicherte Stand unverändert (kein Tonie wird als „fehlt“ markiert)."""
     try:
         a = a or api()
-        ts = a.get_all_creative_tonies() or []
+        ts = a.creative_tonies()
     except Exception as e:  # noqa
         CLOUD["fehler"] = str(e)[:300]
         raise
@@ -301,42 +324,65 @@ def verlauf(t, eintrag):
     t["verlauf"] = ([dict(zeit=time.strftime("%Y-%m-%d %H:%M"), **eintrag)] + t["verlauf"])[:60]
 
 
+def inhalt_pruefen(a, tonie, titel_soll, versuche=3, pause=3.0):
+    """Tonie neu abrufen und prüfen, ob genau die hochgeladenen Kapitel drauf sind."""
+    ist = []
+    for i in range(versuche):
+        if i:
+            time.sleep(pause)
+        ist = [str(feld(c, "title") or "").strip() for c in (feld(a.tonie(tonie), "chapters") or [])]
+        if ist == [x.strip() for x in titel_soll]:
+            return
+    raise RuntimeError(f"Upload nicht bestätigt: Auf dem Tonie liegen {len(ist)} Kapitel statt {len(titel_soll)}"
+                       + (f" ({', '.join(ist[:3])}{' …' if len(ist) > 3 else ''})" if ist else "") + ".")
+
+
 def aufspielen(tid, force=False):
+    """Nächste Folge auf den Tonie spielen. True bei Erfolg, None wenn nichts zu tun war, Exception bei Fehler."""
     with LOCK:
         if RUN["busy"]:
-            return
+            return None
         RUN.update(busy=tid, msg="Wird aufgespielt …")
     name = None
+    upload_begonnen = False
     try:
         with LOCK:
             s = laden()
             t = s["tonies"].get(tid)
             if not t or not t["ordner"]:
-                return
+                return None
             fl = folgen_fuer(s, tid)
             abgleichen(t, fl)
             heute = dt.date.today()
             if not force and (t.get("datum") == heute.isoformat() or pausiert_am(t, heute) or not t["aktiv"]):
-                return
+                return None
             kandidaten = [n for n in t["queue"] if n not in t["aus"]
                           and 0 < sum(dauer(f) for f in fl[n]) / 60 <= MAX_MIN]
             if not kandidaten:
                 log(f"„{t['name']}“: keine passende Folge vorhanden.")
-                return
+                return None
             name = kandidaten[0]
             dateien = fl[name]
         a = api()
-        tonie = next((x for x in a.get_all_creative_tonies() if str(feld(x, "id")) == tid), None)
+        tonie = next((x for x in a.creative_tonies() if str(feld(x, "id")) == tid), None)
         if tonie is None:
             raise RuntimeError("Dieser Kreativ-Tonie ist nicht mehr im Konto.")
         log(f"Bespiele „{feld(tonie, 'name')}“ mit „{name}“ ({len(dateien)} Datei(en)) …")
-        RUN["msg"] = f"Lade „{name}“ hoch …"
-        a.clear_all_chapter_of_tonie(tonie)
+        upload_begonnen = True
+        titel = [(name if len(dateien) == 1 else f"{name} – {i:02d}")[:100] for i in range(1, len(dateien) + 1)]
+        # Erst alle Dateien in den Cloud-Speicher laden (dauert), dann die Kapitel in kurzen Schritten ersetzen –
+        # bricht der lange Teil ab, bleibt der bisherige Inhalt auf dem Tonie.
+        file_ids = []
         for i, f in enumerate(dateien, 1):
             RUN["msg"] = f"Lade „{name}“ hoch … ({i}/{len(dateien)})"
-            titel = name if len(dateien) == 1 else f"{name} – {i:02d}"
-            a.upload_file_to_tonie(tonie, f, titel[:100])
+            file_ids.append(a.datei_hochladen(f))
             log(f"  ✓ {os.path.basename(f)}")
+        RUN["msg"] = "Kapitel werden ersetzt …"
+        a.kapitel_leeren(tonie)
+        for fid, tt in zip(file_ids, titel):
+            a.kapitel_anhaengen(tonie, fid, tt)
+        RUN["msg"] = "Inhalt wird geprüft …"
+        inhalt_pruefen(a, tonie, titel)
         with LOCK:
             s = laden()
             t = s["tonies"][tid]
@@ -353,25 +399,64 @@ def aufspielen(tid, force=False):
                     if len(t["queue"]) > 1 and t["queue"][0] == name:
                         t["queue"].append(t["queue"].pop(0))
             t.update(zuletzt=name, datum=dt.date.today().isoformat())
+            t["fehlversuche"].pop(name, None)
             verlauf(t, {"name": name, "ok": True})
             speichern(s)
         log("Fertig. Die Toniebox lädt die Folge, sobald der Tonie aufgesetzt wird.")
         try:
             RUN["msg"] = "Inhalt wird abgerufen …"
-            time.sleep(5)
             cloud_abrufen(a)
         except Exception:  # noqa
             pass
+        return True
     except Exception as e:  # noqa
         traceback.print_exc()
         with LOCK:
             s = laden()
             if tid in s["tonies"]:
-                verlauf(s["tonies"][tid], {"name": name or "–", "ok": False, "fehler": str(e)[:300]})
+                t = s["tonies"][tid]
+                eintrag = {"name": name or "–", "ok": False, "fehler": str(e)[:300]}
+                # Nur Fehler beim Hochladen zählen gegen die Folge – Anmelde- oder Abruffehler liegen nicht an ihr.
+                if upload_begonnen and name:
+                    n = t["fehlversuche"][name] = t["fehlversuche"].get(name, 0) + 1
+                    if n >= MAX_FEHLVERSUCHE:
+                        t["fehlversuche"].pop(name, None)
+                        if name not in t["aus"]:
+                            t["aus"].append(name)
+                        eintrag["ausgesetzt"] = True
+                        eintrag["fehler"] = f"{n}. Fehlversuch – Folge ausgesetzt. {eintrag['fehler']}"[:300]
+                        log(f"„{t['name']}“: „{name}“ nach {n} Fehlversuchen ausgesetzt.")
+                verlauf(t, eintrag)
                 speichern(s)
         raise
     finally:
         RUN.update(busy=None, msg="")
+
+
+def planer_runde(naechster_versuch, now=None):
+    """Ein Durchgang des Planers: jeden fälligen Tonie bespielen."""
+    s = laden()
+    now = now or dt.datetime.now()
+    for tid, t in s["tonies"].items():
+        try:                                       # ein Tonie mit Problemen hält die anderen nicht auf
+            if not t["aktiv"] or not t["ordner"] or t["fehlt"]:
+                continue
+            h, m = (int(x) for x in t["uhrzeit"].split(":"))
+            faellig = dt.datetime.combine(now.date(), dt.time(h, m))
+            # fällig ab Uhrzeit, Nachholen bis 3 Stunden später
+            if (faellig <= now < faellig + dt.timedelta(hours=3) and t.get("datum") != now.date().isoformat()
+                    and not pausiert_am(t, now.date()) and time.time() >= naechster_versuch.get(tid, 0)):
+                try:
+                    ok = aufspielen(tid)
+                except Exception:  # noqa
+                    ok = False
+                if ok:
+                    naechster_versuch.pop(tid, None)
+                else:                              # Fehler oder nichts Passendes: in 10 min erneut
+                    naechster_versuch[tid] = time.time() + 600
+        except Exception:  # noqa
+            log(f"Planer: Fehler bei „{t.get('name')}“:")
+            traceback.print_exc()
 
 
 def planer():
@@ -387,21 +472,7 @@ def planer():
                 except Exception as e:  # noqa
                     log(f"Tonie-Cloud nicht erreichbar: {e}")
                     letzter_abruf = time.time() - CLOUD_ALLE_STUNDEN * 3600 + 900   # in 15 min erneut
-            s = laden()
-            now = dt.datetime.now()
-            for tid, t in s["tonies"].items():
-                if not t["aktiv"] or not t["ordner"] or t["fehlt"]:
-                    continue
-                h, m = (int(x) for x in t["uhrzeit"].split(":"))
-                faellig = dt.datetime.combine(now.date(), dt.time(h, m))
-                # fällig ab Uhrzeit, Nachholen bis 3 Stunden später
-                if (faellig <= now < faellig + dt.timedelta(hours=3) and t.get("datum") != now.date().isoformat()
-                        and not pausiert_am(t, now.date()) and time.time() >= naechster_versuch.get(tid, 0)):
-                    try:
-                        aufspielen(tid)
-                        naechster_versuch.pop(tid, None)
-                    except Exception:  # noqa
-                        naechster_versuch[tid] = time.time() + 600
+            planer_runde(naechster_versuch)
         except Exception:  # noqa
             traceback.print_exc()
         time.sleep(30)
@@ -486,7 +557,11 @@ class Web(BaseHTTPRequestHandler):
                                                 [x for x in t["queue"] if x not in neu]))
             elif p == "/api/aussetzen":
                 nm = b.get("name")
-                aendern(tid, lambda t: t["aus"].remove(nm) if nm in t["aus"] else t["aus"].append(nm))
+
+                def f(t):
+                    t["fehlversuche"].pop(nm, None)
+                    t["aus"].remove(nm) if nm in t["aus"] else t["aus"].append(nm)
+                aendern(tid, f)
             elif p == "/api/naechste":
                 nm = b.get("name")
                 aendern(tid, lambda t: t.update(queue=[nm] + [x for x in t["queue"] if x != nm])
@@ -501,13 +576,13 @@ class Web(BaseHTTPRequestHandler):
             elif p == "/api/einstellungen":
                 uz, mo = b.get("uhrzeit"), b.get("modus")
                 ordner, aktiv = b.get("ordner", "unverändert"), b.get("aktiv")
+                neue_uhrzeit = uhrzeit_pruefen(uz) if uz else None      # vor dem Speichern prüfen
                 if ordner not in ("unverändert", None, HAUPT) and ordner not in unterordner():
                     raise ValueError("Diesen Ordner gibt es nicht.")
 
                 def f(t):
                     if uz:
-                        h, m = (int(x) for x in uz.split(":"))
-                        t["uhrzeit"] = f"{h:02d}:{m:02d}"
+                        t["uhrzeit"] = neue_uhrzeit
                     if mo in ("reihenfolge", "zufall"):
                         t["modus"] = mo
                     if ordner != "unverändert" and ordner != t["ordner"]:
@@ -661,7 +736,7 @@ function renderDetail(){
       <div class="row" style="margin-bottom:10px"><button id="mischen">🔀 Mischen</button><span class="muted">Ordner: <code>${esc(t.pfad)}</code></span></div>
       <ol id="list">${t.plan.length?t.plan.map((r,i)=>`<li class="f ${r.aus||r.zu_lang||r.defekt?'off':''}" draggable="true" data-n="${esc(r.name)}">
        <div class="date ${r.termin===z.heute?'today':''}">${r.termin?tag(r.termin):(r.aus?'<b>aus</b>':r.zu_lang?'<b>zu lang</b>':r.defekt?'<b>defekt</b>':(t.aktiv?'<b>Pause</b>':'<b>–</b>'))}</div>
-       <div><div class="nm">${esc(r.name)}${r.zu_lang?`<span class="tag w">über ${Math.round(z.max)} min</span>`:''}${r.defekt?'<span class="tag w">Datei leer/defekt – neu kopieren</span>':''}</div>
+       <div><div class="nm">${esc(r.name)}${r.zu_lang?`<span class="tag w">über ${Math.round(z.max)} min</span>`:''}${r.defekt?'<span class="tag w">Datei leer/defekt – neu kopieren</span>':''}${r.fehlversuche?`<span class="tag w">${r.fehlversuche}× fehlgeschlagen</span>`:''}</div>
          <div class="meta">${r.minuten?r.minuten+' min · ':''}${r.dateien} ${r.dateien===1?'Datei':'Kapitel'}</div></div>
        <div class="acts"><span class="handle">⠿</span>
          <button data-a="up" ${i===0?'disabled':''} title="nach oben">↑</button><button data-a="down" ${i===t.plan.length-1?'disabled':''} title="nach unten">↓</button>
@@ -692,29 +767,29 @@ function bind(){
     const n=li.dataset.n;
     li.querySelectorAll('button[data-a]').forEach(b=>b.onclick=()=>{
       const a=b.dataset.a, q=order(), i=q.indexOf(n);
-      if(a==='up'||a==='down'){ const j=a==='up'?i-1:i+1; [q[i],q[j]]=[q[j],q[i]]; api('/api/reihenfolge',{queue:q}).then(render); }
-      if(a==='next') api('/api/naechste',{name:n}).then(render);
-      if(a==='aus') api('/api/aussetzen',{name:n}).then(render);
+      if(a==='up'||a==='down'){ const j=a==='up'?i-1:i+1; [q[i],q[j]]=[q[j],q[i]]; api('api/reihenfolge',{queue:q}).then(render); }
+      if(a==='next') api('api/naechste',{name:n}).then(render);
+      if(a==='aus') api('api/aussetzen',{name:n}).then(render);
     });
     li.ondragstart=e=>{dragName=n; li.classList.add('drag'); e.dataTransfer.effectAllowed='move';};
     li.ondragend=()=>{dragName=null; li.classList.remove('drag'); document.querySelectorAll('.over').forEach(x=>x.classList.remove('over'));};
     li.ondragover=e=>{e.preventDefault(); li.classList.add('over');};
     li.ondragleave=()=>li.classList.remove('over');
-    li.ondrop=e=>{e.preventDefault(); if(!dragName||dragName===n) return; const q=order().filter(x=>x!==dragName); q.splice(q.indexOf(n),0,dragName); dragName=null; api('/api/reihenfolge',{queue:q}).then(render);};
+    li.ondrop=e=>{e.preventDefault(); if(!dragName||dragName===n) return; const q=order().filter(x=>x!==dragName); q.splice(q.indexOf(n),0,dragName); dragName=null; api('api/reihenfolge',{queue:q}).then(render);};
   });
-  document.querySelectorAll('[data-pause]').forEach(b=>b.onclick=()=>api('/api/pause',{bis:b.dataset.pause||null}).then(render));
+  document.querySelectorAll('[data-pause]').forEach(b=>b.onclick=()=>api('api/pause',{bis:b.dataset.pause||null}).then(render));
   const on=(id,fn)=>{const e=$('#'+id); if(e) e.onclick=fn;};
-  on('jetzt',()=>{ const nx=T.plan.find(r=>!r.aus&&!r.zu_lang&&!r.defekt); if(nx&&confirm(`„${nx.name}“ jetzt auf „${T.name}“ spielen? Was gerade drauf ist, wird ersetzt.`)) api('/api/jetzt',{}).then(render); });
-  on('mischen',()=>api('/api/mischen',{}).then(render));
-  on('anmachen',()=>{ if(confirm(`„${T.name}“ ab jetzt jeden Abend um ${T.uhrzeit} Uhr automatisch neu bespielen? Was gerade drauf ist, wird dabei ersetzt.`)) api('/api/einstellungen',{aktiv:true}).then(render); });
-  on('pauseSet',()=>{ const d=$('#pauseDate').value; if(!d) return alert('Bitte ein Datum wählen.'); api('/api/pause',{bis:d}).then(render); });
+  on('jetzt',()=>{ const nx=T.plan.find(r=>!r.aus&&!r.zu_lang&&!r.defekt); if(nx&&confirm(`„${nx.name}“ jetzt auf „${T.name}“ spielen? Was gerade drauf ist, wird ersetzt.`)) api('api/jetzt',{}).then(render); });
+  on('mischen',()=>api('api/mischen',{}).then(render));
+  on('anmachen',()=>{ if(confirm(`„${T.name}“ ab jetzt jeden Abend um ${T.uhrzeit} Uhr automatisch neu bespielen? Was gerade drauf ist, wird dabei ersetzt.`)) api('api/einstellungen',{aktiv:true}).then(render); });
+  on('pauseSet',()=>{ const d=$('#pauseDate').value; if(!d) return alert('Bitte ein Datum wählen.'); api('api/pause',{bis:d}).then(render); });
   on('save',()=>{ const o=$('#ordner').value;
     if(o!==T.ordner && !confirm('Ordner wechseln? Der Plan dieses Tonies beginnt dann neu.')) return;
-    DIRTY=null; api('/api/einstellungen',{uhrzeit:$('#uhrzeit').value,modus:$('#modus').value,ordner:o,aktiv:$('#aktiv').checked}).then(render); });
-  on('ordnerSet',()=>{ const o=$('#ordnerNeu').value; if(!o) return alert('Bitte einen Ordner wählen.'); DIRTY=null; api('/api/einstellungen',{ordner:o,aktiv:true}).then(render); });
+    DIRTY=null; api('api/einstellungen',{uhrzeit:$('#uhrzeit').value,modus:$('#modus').value,ordner:o,aktiv:$('#aktiv').checked}).then(render); });
+  on('ordnerSet',()=>{ const o=$('#ordnerNeu').value; if(!o) return alert('Bitte einen Ordner wählen.'); DIRTY=null; api('api/einstellungen',{ordner:o,aktiv:true}).then(render); });
 }
-$('#abrufen').onclick=async()=>{ const b=$('#abrufen'); b.disabled=true; b.textContent='⏳ Wird abgerufen …'; try{ render(await api('/api/tonies',{})); }catch(e){} b.disabled=false; b.textContent='↻ Tonies abrufen'; };
-async function tick(){ try{ const r=await fetch('/api/zustand'+(SEL?'?t='+encodeURIComponent(SEL):'')); render(await r.json()); }catch(e){} }
+$('#abrufen').onclick=async()=>{ const b=$('#abrufen'); b.disabled=true; b.textContent='⏳ Wird abgerufen …'; try{ render(await api('api/tonies',{})); }catch(e){} b.disabled=false; b.textContent='↻ Tonies abrufen'; };
+async function tick(){ try{ const r=await fetch('api/zustand'+(SEL?'?t='+encodeURIComponent(SEL):'')); render(await r.json()); }catch(e){} }
 window.onhashchange=()=>{ SEL=decodeURIComponent(location.hash.slice(1))||SEL; tick(); };
 tick(); setInterval(()=>{ if(!dragName) tick(); }, 8000);
 </script></body></html>"""
@@ -750,7 +825,7 @@ if __name__ == "__main__":
             print(f"(Tonie-Cloud nicht erreichbar: {e})")
         zeige_liste()
     elif arg == "--tonies":
-        for t in api().get_all_creative_tonies():
+        for t in api().creative_tonies():
             print(f" • {feld(t, 'name')}")
     else:
         threading.Thread(target=planer, daemon=True).start()

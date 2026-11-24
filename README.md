@@ -13,7 +13,7 @@ und am nächsten Morgen ist sie auf der Toniebox, sobald der Tonie aufgesetzt wi
 > Hörspiele bereitstellen wollte. Der Code wurde im Alltag benutzt und mit nachgebildeten Daten getestet, aber nicht
 > von einem Menschen Zeile für Zeile geprüft. Bitte lies ihn, bevor du ihm dein tonies-Passwort anvertraust.
 
-> ⚠️ **Inoffiziell:** Kein Produkt der Boxine GmbH (tonies®). Tonie Management nutzt die inoffizielle Bibliothek
+> ⚠️ **Inoffiziell:** Kein Produkt der Boxine GmbH (tonies®). Tonie Management nutzt die inoffizielle Schnittstelle wie die Bibliothek
 > [tonie-api](https://github.com/Wilhelmsson177/tonie-api). Ändert tonies seine Schnittstelle, kann es jederzeit
 > aufhören zu funktionieren.
 
@@ -124,7 +124,7 @@ docker logs -f tonie-management                                      # Protokoll
 - Dein tonies-Passwort steht im Klartext in `.env` auf deinem Rechner. Diese Datei ist in `.gitignore` – **niemals einchecken**.
 - Die Weboberfläche hat **keine Anmeldung**. Nur im Heimnetz betreiben, **keine Portfreigabe** im Router einrichten.
   Für Zugriff von unterwegs ein VPN nutzen (z. B. das der FRITZ!Box, WireGuard oder Tailscale).
-- Tonie Management spricht nur mit der tonies-Cloud (über tonie-api). Es sendet keine Nutzungsdaten irgendwohin.
+- Tonie Management spricht nur mit der tonies-Cloud (`app/tonie_cloud.py`). Es sendet keine Nutzungsdaten irgendwohin.
 - Der Hörspiel-Ordner wird nur lesend eingebunden; Tonie Management verändert oder löscht dort nichts.
 - Gespeichert wird nur `data/stand.json` (Pläne, Verlauf, zuletzt abgerufener Tonie-Inhalt) und `data/dauer.json` (Laufzeiten-Cache).
 
@@ -143,13 +143,24 @@ docker logs -f tonie-management                                      # Protokoll
 ## Projektaufbau
 
 ```
-app/tonie_management.py   Dienst: Zeitplan, Upload, Weboberfläche (eine Datei, nur Standardbibliothek + 2 Pakete)
+app/tonie_management.py   Dienst: Zeitplan, Upload, Weboberfläche
+app/tonie_cloud.py        Client für die tonies-Cloud (Timeouts, Fehler brechen ab)
+tests/                    Tests mit nachgebildeter Cloud
 Dockerfile           Container auf Basis von python:3.12-slim
 docker-compose.yml   Start, Ordner-Einbindung, Port
 install.sh           Einrichtung/Aktualisierung
 .env.example         Vorlage für die Einstellungen
 THIRD_PARTY.md       Verwendete Bibliotheken und ihre Lizenzen
 ```
+
+## Tests
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install requests mutagen pytest responses
+.venv/bin/python -m pytest -q tests
+```
+
+Die Tests laufen gegen eine nachgebildete tonies-Cloud (`tests/conftest.py`), nicht gegen das echte Konto.
 
 ## Danksagung & verwendete Bibliotheken
 

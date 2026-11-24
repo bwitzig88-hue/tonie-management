@@ -8,6 +8,7 @@ services:
     env_file: .env
     environment:
       - TZ=${TZ:-Europe/Berlin}
+      - PORT=8095        # im Container immer 8095; nach außen gilt PORT aus .env (siehe ports)
       - HOERSPIEL_DIR=/hoerspiele
       - STATE_FILE=/data/stand.json
       - ORDNER_ANZEIGE=${HOERSPIEL_ORDNER:-./hoerspiele}

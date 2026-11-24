@@ -1,5 +1,20 @@
 # Änderungen
 
+## 1.1.0 – unveröffentlicht (Fork)
+Zuverlässigkeit.
+
+- Eigener Cloud-Client (`app/tonie_cloud.py`) statt `tonie-api`: jeder Aufruf mit Timeout, jeder HTTP-Fehler bricht ab
+  (vorher wurden Fehler beim Löschen/Anlegen von Kapiteln still verschluckt und als Erfolg verbucht)
+- Upload wird geprüft: Der Tonie wird danach neu abgerufen, erst wenn genau die neuen Kapitel drauf sind, gilt er als bespielt
+- Erst alle Dateien hochladen, dann die Kapitel ersetzen – bricht der Upload ab, bleibt der alte Inhalt auf dem Tonie
+- Folgen, die 3-mal beim Hochladen scheitern, werden ausgesetzt (`MAX_FEHLVERSUCHE`); Anmelde-/Abruffehler zählen nicht
+- Kurzer Cloud-Ausfall markiert keine Tonies mehr als „nicht mehr im Konto“
+- Uhrzeit wird beim Speichern geprüft; eine kaputte gespeicherte Uhrzeit wird auf 17:30 gesetzt statt den Planer
+  für alle Tonies anzuhalten; jeder Tonie wird im Planer einzeln abgesichert
+- Port-Fehler behoben: im Container immer 8095, `PORT` gilt nur nach außen
+- Weboberfläche nutzt relative Pfade (Vorbereitung für Home-Assistant-Ingress)
+- Tests mit nachgebildeter Cloud (`pytest tests`)
+
 ## 1.0.0 – 2026-11-13
 Erste öffentliche Version.
 
