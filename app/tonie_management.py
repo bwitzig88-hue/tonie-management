@@ -29,10 +29,15 @@ import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+from tonie_cloud import CloudFehler, TonieCloud
+
 ROOT = os.environ.get("HOERSPIEL_DIR", "/hoerspiele")
 ANZEIGE = os.environ.get("ORDNER_ANZEIGE", ROOT)          # Pfad, wie er auf dem Gastrechner heißt (nur zur Anzeige)
 STATE = os.environ.get("STATE_FILE", "/data/stand.json")
 CACHE = os.path.join(os.path.dirname(STATE) or ".", "dauer.json")
+SICHERUNG = os.path.join(os.path.dirname(STATE) or ".", "sicherung")   # Kapitellisten vor jedem Aufspielen
+SICHERUNGEN_JE_TONIE = 10
+UMWANDLUNG_WARTEN = int(os.environ.get("UMWANDLUNG_WARTEN", "180"))   # s, so lange auf das Umwandeln der Cloud warten
 PORT = int(os.environ.get("PORT", "8095"))
 TONIE_NAME = os.environ.get("TONIE_NAME", "").strip()      # nur noch für die Übernahme alter Einstellungen
 MAX_MIN = float(os.environ.get("MAX_MINUTEN", "89"))       # Kreativ-Tonie fasst ca. 90 Minuten
@@ -236,7 +241,6 @@ def plan(t, fl):
 
 # ---------------------------------------------------------------- Tonie-Cloud
 def api():
-    from tonie_cloud import TonieCloud
     return TonieCloud(os.environ.get("TONIES_USER"), os.environ.get("TONIES_PASS"))
 
 
@@ -324,15 +328,45 @@ def verlauf(t, eintrag):
     t["verlauf"] = ([dict(zeit=time.strftime("%Y-%m-%d %H:%M"), **eintrag)] + t["verlauf"])[:60]
 
 
+def kapitel_sichern(tid, kapitel):
+    """Bisherige Kapitelliste ablegen, damit sie sich zurückspielen lässt (die Cloud bietet keinen Audio-Download)."""
+    os.makedirs(SICHERUNG, exist_ok=True)
+    pfad = os.path.join(SICHERUNG, f"{tid}-{time.strftime('%Y%m%d-%H%M%S')}.json")
+    with open(pfad, "w", encoding="utf-8") as f:
+        json.dump(kapitel, f, ensure_ascii=False, indent=2)
+    alte = sorted(x for x in os.listdir(SICHERUNG) if x.startswith(f"{tid}-") and x.endswith(".json"))
+    for x in alte[:-SICHERUNGEN_JE_TONIE]:
+        os.remove(os.path.join(SICHERUNG, x))
+    return pfad
+
+
 def inhalt_pruefen(a, tonie, titel_soll, versuche=3, pause=3.0):
-    """Tonie neu abrufen und prüfen, ob genau die hochgeladenen Kapitel drauf sind."""
+    """Tonie neu abrufen und prüfen, ob genau die hochgeladenen Kapitel drauf sind (Titel + Reihenfolge, keine IDs –
+    die vergibt die Cloud beim Tausch teils neu). Wartet danach, bis die Cloud mit dem Umwandeln fertig ist,
+    damit Umwandlungsfehler noch erkannt werden."""
     ist = []
     for i in range(versuche):
         if i:
             time.sleep(pause)
-        ist = [str(feld(c, "title") or "").strip() for c in (feld(a.tonie(tonie), "chapters") or [])]
+        d = a.tonie(tonie)
+        if feld(d, "transcodingErrors"):
+            raise RuntimeError(f"Cloud meldet Umwandlungsfehler: {str(feld(d, 'transcodingErrors'))[:150]}")
+        ist = [str(feld(c, "title") or "").strip() for c in (feld(d, "chapters") or [])]
         if ist == [x.strip() for x in titel_soll]:
-            return
+            break
+    else:
+        ist = None
+    if ist is not None:
+        frist = time.time() + UMWANDLUNG_WARTEN
+        while feld(d, "transcoding") and time.time() < frist:
+            time.sleep(10)
+            d = a.tonie(tonie)
+            if feld(d, "transcodingErrors"):
+                raise RuntimeError(f"Cloud meldet Umwandlungsfehler: {str(feld(d, 'transcodingErrors'))[:150]}")
+        if feld(d, "transcoding"):
+            log(f"  Cloud wandelt nach {UMWANDLUNG_WARTEN} s noch um – Titel stimmen, gilt als erfolgreich.")
+        return
+    ist = [str(feld(c, "title") or "").strip() for c in (feld(d, "chapters") or [])]
     raise RuntimeError(f"Upload nicht bestätigt: Auf dem Tonie liegen {len(ist)} Kapitel statt {len(titel_soll)}"
                        + (f" ({', '.join(ist[:3])}{' …' if len(ist) > 3 else ''})" if ist else "") + ".")
 
@@ -370,19 +404,34 @@ def aufspielen(tid, force=False):
         log(f"Bespiele „{feld(tonie, 'name')}“ mit „{name}“ ({len(dateien)} Datei(en)) …")
         upload_begonnen = True
         titel = [(name if len(dateien) == 1 else f"{name} – {i:02d}")[:100] for i in range(1, len(dateien) + 1)]
-        # Erst alle Dateien in den Cloud-Speicher laden (dauert), dann die Kapitel in kurzen Schritten ersetzen –
-        # bricht der lange Teil ab, bleibt der bisherige Inhalt auf dem Tonie.
+        # Erst alle Dateien in den Cloud-Speicher laden (dauert) – bricht das ab, ist auf dem Tonie nichts verändert.
         file_ids = []
         for i, f in enumerate(dateien, 1):
             RUN["msg"] = f"Lade „{name}“ hoch … ({i}/{len(dateien)})"
             file_ids.append(a.datei_hochladen(f))
             log(f"  ✓ {os.path.basename(f)}")
-        RUN["msg"] = "Kapitel werden ersetzt …"
-        a.kapitel_leeren(tonie)
-        for fid, tt in zip(file_ids, titel):
-            a.kapitel_anhaengen(tonie, fid, tt)
-        RUN["msg"] = "Inhalt wird geprüft …"
-        inhalt_pruefen(a, tonie, titel)
+        # Bisherigen Inhalt sichern, dann in EINEM Schritt tauschen. Schlägt danach etwas fehl, wird zurückgespielt.
+        alt = feld(a.tonie(tonie), "chapters") or []
+        kapitel_sichern(tid, alt)
+        RUN["msg"] = "Kapitel werden getauscht …"
+        try:
+            try:
+                a.kapitel_setzen(tonie, [{"id": fid, "file": fid, "title": tt} for fid, tt in zip(file_ids, titel)])
+            except CloudFehler as e:
+                log(f"  Tausch in einem Schritt abgelehnt ({e}) – ersetze Kapitel einzeln.")
+                a.kapitel_leeren(tonie)
+                for fid, tt in zip(file_ids, titel):
+                    a.kapitel_anhaengen(tonie, fid, tt)
+            RUN["msg"] = "Inhalt wird geprüft …"
+            inhalt_pruefen(a, tonie, titel)
+        except Exception as e:  # noqa
+            try:
+                a.kapitel_setzen(tonie, alt, "Alten Inhalt zurückspielen")
+                hinweis = "Alter Inhalt wurde zurückgespielt."
+            except Exception as e2:  # noqa
+                hinweis = f"Zurückspielen fehlgeschlagen ({e2}) – Sicherung liegt in {SICHERUNG}."
+            log(f"  {hinweis}")
+            raise RuntimeError(f"{e} {hinweis}") from e
         with LOCK:
             s = laden()
             t = s["tonies"][tid]

@@ -1,6 +1,7 @@
 """Aufspielen gegen die nachgebildete Cloud: Erfolg, stille Fehler, Abbrüche, Fehlversuche, Planer, Uhrzeit."""
 import datetime as dt
 import json
+import os
 import threading
 import urllib.error
 import urllib.request
@@ -24,12 +25,74 @@ def test_erfolg_bucht_folge_und_ersetzt_inhalt(tm):
     assert t["queue"][0] == "Folge 2"
 
 
-def test_erst_hochladen_dann_kapitel_ersetzen(tm):
+def test_erst_hochladen_dann_in_einem_schritt_tauschen(tm):
     tid = tonie_einplanen(tm, "Drache", "Folge 1")
     tm.FAKE.aufrufe.clear()
     tm.aufspielen(tid, force=True)
     a = tm.FAKE.aufrufe
-    assert a.index("upload") < a.index("leeren") < a.index("kapitel")
+    assert a.index("upload") < a.index("setzen")
+    assert "leeren" not in a and "kapitel" not in a
+
+
+def test_vor_dem_tausch_wird_alter_inhalt_gesichert(tm):
+    tid = tonie_einplanen(tm, "Drache", "Folge 1", kapitel=("Altes Hörspiel", "Teil 2"))
+    tm.aufspielen(tid, force=True)
+    dateien = [f for f in os.listdir(tm.SICHERUNG) if f.startswith(tid)]
+    assert len(dateien) == 1
+    gesichert = json.load(open(os.path.join(tm.SICHERUNG, dateien[0])))
+    assert [k["title"] for k in gesichert] == ["Altes Hörspiel", "Teil 2"]
+
+
+def test_sicherungen_werden_begrenzt(tm, monkeypatch):
+    tid = tonie_einplanen(tm, "Drache", "Folge 1")
+    zeiten = iter(f"2026010{i}-120000" for i in range(1, 10))
+    monkeypatch.setattr(tm, "SICHERUNGEN_JE_TONIE", 3)
+    monkeypatch.setattr(tm.time, "strftime", lambda f, *a: next(zeiten) if f == "%Y%m%d-%H%M%S" else "2026-01-01 12:00")
+    for _ in range(5):
+        tm.kapitel_sichern(tid, [])
+    assert sorted(os.listdir(tm.SICHERUNG)) == [f"{tid}-2026010{i}-120000.json" for i in (3, 4, 5)]
+
+
+def test_tausch_abgelehnt_faellt_auf_einzelschritte_zurueck(tm):
+    tid = tonie_einplanen(tm, "Drache", "Folge 1")
+    tm.FAKE.fehler["setzen"] = CloudFehler("Kapitel tauschen: HTTP 400")
+    assert tm.aufspielen(tid, force=True) is True
+    assert tm.FAKE.titel(tid) == ["Folge 1"]
+    assert "leeren" in tm.FAKE.aufrufe
+
+
+def test_pruefung_fehlgeschlagen_spielt_alten_inhalt_zurueck(tm):
+    tid = tonie_einplanen(tm, "Drache", "Folge 1", kapitel=("Altes Hörspiel",))
+    tm.FAKE.verschlucke_kapitel = True
+    with pytest.raises(RuntimeError, match="zurückgespielt"):
+        tm.aufspielen(tid, force=True)
+    assert tm.FAKE.titel(tid) == ["Altes Hörspiel"]
+    assert "zurückgespielt" in stand(tm, tid)["verlauf"][0]["fehler"]
+
+
+def test_einzelschritte_scheitern_halb_alter_inhalt_kommt_zurueck(tm):
+    tid = tonie_einplanen(tm, "Drache", "Folge 1", kapitel=("Altes Hörspiel",))
+    tm.FAKE.fehler["setzen"] = CloudFehler("Kapitel tauschen: HTTP 400")
+    tm.FAKE.fehler["kapitel"] = CloudFehler("Kapitel anlegen: HTTP 500")
+    with pytest.raises(RuntimeError, match="zurückgespielt"):
+        tm.aufspielen(tid, force=True)
+    assert tm.FAKE.titel(tid) == ["Altes Hörspiel"]     # war nach „leeren“ kurz leer
+
+
+def test_umwandlungsfehler_der_cloud_wird_erkannt(tm):
+    tid = tonie_einplanen(tm, "Drache", "Folge 1", kapitel=("Altes Hörspiel",))
+    tm.FAKE.umwandlungsfehler = [{"file": "x", "error": "unsupported"}]
+    with pytest.raises(RuntimeError, match="Umwandlungsfehler"):
+        tm.aufspielen(tid, force=True)
+    assert tm.FAKE.titel(tid) == ["Altes Hörspiel"]
+
+
+def test_zurueckspielen_scheitert_nennt_sicherung(tm):
+    tid = tonie_einplanen(tm, "Drache", "Folge 1")
+    tm.FAKE.verschlucke_kapitel = True
+    tm.FAKE.fehler["zurueck"] = CloudFehler("Alten Inhalt zurückspielen: HTTP 500")
+    with pytest.raises(RuntimeError, match="Sicherung liegt in"):
+        tm.aufspielen(tid, force=True)
 
 
 def test_kapitel_verschluckt_wird_als_fehler_erkannt(tm):
@@ -80,8 +143,9 @@ def test_anmeldefehler_zaehlt_nicht_gegen_die_folge(tm):
 
 def test_wieder_einplanen_setzt_zaehler_zurueck(tm):
     tid = tonie_einplanen(tm, "Drache", "Folge 1")
+    tm.FAKE.fehler["setzen"] = CloudFehler("Kapitel tauschen: HTTP 500")
     tm.FAKE.fehler["kapitel"] = CloudFehler("Kapitel anlegen: HTTP 500")
-    with pytest.raises(CloudFehler):
+    with pytest.raises(RuntimeError):
         tm.aufspielen(tid, force=True)
     assert stand(tm, tid)["fehlversuche"] == {"Folge 1": 1}
     # in der Oberfläche aussetzen und wieder einplanen
@@ -193,3 +257,20 @@ def test_defekte_datei_wird_nicht_hochgeladen(tm):
     tm.aendern(tid, lambda t: t.update(aktiv=True, queue=["Leer", "Gut"]))
     tm.aufspielen(tid, force=True)
     assert tm.FAKE.titel(tid) == ["Gut"]
+
+
+def test_umwandlungsfehler_nach_dem_umwandeln_wird_erkannt(tm):
+    """Echte Cloud: direkt nach dem Tausch stimmen die Titel, Fehler zeigen sich erst nach dem Umwandeln."""
+    tid = tonie_einplanen(tm, "Drache", "Folge 1", kapitel=("Altes Hörspiel",))
+    tm.FAKE.umwandeln_noch = 3
+    tm.FAKE.fehler_nach_umwandlung = [{"error": "corrupt"}]
+    with pytest.raises(RuntimeError, match="Umwandlungsfehler"):
+        tm.aufspielen(tid, force=True)
+    assert tm.FAKE.titel(tid) == ["Altes Hörspiel"]
+
+
+def test_warten_auf_umwandlung_dann_erfolg(tm):
+    tid = tonie_einplanen(tm, "Drache", "Folge 1")
+    tm.FAKE.umwandeln_noch = 3
+    assert tm.aufspielen(tid, force=True) is True
+    assert tm.FAKE.umwandeln_noch == 0

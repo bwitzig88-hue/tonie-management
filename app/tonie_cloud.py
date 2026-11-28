@@ -94,6 +94,11 @@ class TonieCloud:
         _pruefen(r, "Datei hochladen")
         return file_id
 
+    def kapitel_setzen(self, t, kapitel, was="Kapitel tauschen"):
+        """Alle Kapitel in einem Schritt ersetzen. kapitel: Liste von dicts (mind. title + file)."""
+        return self._req("PATCH", f"households/{t['householdId']}/creativetonies/{t['id']}", was,
+                         json={"chapters": kapitel})
+
     def kapitel_leeren(self, t):
         self._req("PATCH", f"households/{t['householdId']}/creativetonies/{t['id']}", "Kapitel löschen",
                   json={"chapters": []})

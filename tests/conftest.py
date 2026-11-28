@@ -14,7 +14,7 @@ class FakeCloud:
     """Verhält sich wie TonieCloud, hält die Kreativ-Tonies im Speicher und protokolliert alle Aufrufe.
 
     Fehler lassen sich gezielt einschalten:
-      fehler["login" | "liste" | "upload" | "leeren" | "kapitel"] = Exception
+      fehler["login" | "liste" | "abrufen" | "upload" | "setzen" | "zurueck" | "leeren" | "kapitel"] = Exception
       verschlucke_kapitel = True  → Kapitel anlegen „klappt“, landet aber nicht auf dem Tonie
     """
 
@@ -24,6 +24,10 @@ class FakeCloud:
         self.fehler = {}
         self.verschlucke_kapitel = False
         self.uploads = {}
+        self.alle_kapitel = []          # jede Datei, die je auf einem Tonie lag (darf zurückgespielt werden)
+        self.umwandlungsfehler = []     # wird als transcodingErrors gemeldet
+        self.umwandeln_noch = 0         # so viele Abrufe meldet der Tonie noch transcoding=True …
+        self.fehler_nach_umwandlung = []  # … danach erscheinen diese transcodingErrors
 
     def neuer_tonie(self, name, kapitel=()):
         tid = f"t-{len(self.tonies) + 1}"
@@ -31,6 +35,8 @@ class FakeCloud:
                             "secondsPresent": 0, "secondsRemaining": 5400,
                             "chapters": [{"id": f"c{i}", "title": k, "file": "x", "seconds": 60, "transcoding": False}
                                          for i, k in enumerate(kapitel)]}
+        self.tonies[tid]["chapters"] = [dict(c, file=f"{tid}-{c['id']}") for c in self.tonies[tid]["chapters"]]
+        self.alle_kapitel += self.tonies[tid]["chapters"]
         return tid
 
     def _ggf_fehler(self, was):
@@ -45,13 +51,34 @@ class FakeCloud:
 
     def tonie(self, t):
         self._ggf_fehler("abrufen")
-        return copy.deepcopy(self.tonies[t["id"]])
+        umwandeln = self.umwandeln_noch > 0
+        if umwandeln:
+            self.umwandeln_noch -= 1
+            if not self.umwandeln_noch:
+                self.umwandlungsfehler += self.fehler_nach_umwandlung
+        return dict(copy.deepcopy(self.tonies[t["id"]]), transcoding=umwandeln,
+                    transcodingErrors=list(self.umwandlungsfehler))
 
     def datei_hochladen(self, pfad):
         self._ggf_fehler("upload")
         fid = str(uuid.uuid4())
         self.uploads[fid] = pfad
         return fid
+
+    def kapitel_setzen(self, t, kapitel, was="Kapitel tauschen"):
+        zurueck = was != "Kapitel tauschen"
+        self._ggf_fehler("zurueck" if zurueck else "setzen")
+        bekannt = set(self.uploads) | {c["file"] for c in self.alle_kapitel}
+        for k in kapitel:
+            if k["file"] not in bekannt:
+                raise AssertionError("Kapitel mit unbekannter Datei")
+        if self.verschlucke_kapitel and not zurueck:
+            return {}
+        neu = [{"id": k.get("id") or k["file"], "title": k["title"], "file": k["file"],
+                "seconds": k.get("seconds", 60), "transcoding": False, "type": "file"} for k in kapitel]
+        self.tonies[t["id"]]["chapters"] = neu
+        self.alle_kapitel += neu
+        return copy.deepcopy(self.tonies[t["id"]])
 
     def kapitel_leeren(self, t):
         self._ggf_fehler("leeren")

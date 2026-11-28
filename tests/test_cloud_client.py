@@ -84,3 +84,18 @@ def test_upload_ok_liefert_file_id(cloud, tmp_path):
     rs.post(f"{tc.API_URL}/file", json={"fileId": "f1", "request": {"url": "https://s3.example/up", "fields": {"key": "f1"}}})
     rs.post("https://s3.example/up", status=204)
     assert c.datei_hochladen(str(f)) == "f1"
+
+
+def test_kapitel_setzen_schickt_vollstaendige_liste(cloud):
+    rs, c = cloud
+    rs.patch(f"{CT}/t1", json={"chapters": [{"id": "f1"}]})
+    c.kapitel_setzen(TONIE, [{"id": "f1", "file": "f1", "title": "A"}])
+    import json
+    assert json.loads(rs.calls[-1].request.body) == {"chapters": [{"id": "f1", "file": "f1", "title": "A"}]}
+
+
+def test_kapitel_setzen_fehler_bricht_ab(cloud):
+    rs, c = cloud
+    rs.patch(f"{CT}/t1", status=400, json={"error": "bad"})
+    with pytest.raises(tc.CloudFehler, match="Kapitel tauschen: HTTP 400"):
+        c.kapitel_setzen(TONIE, [])
