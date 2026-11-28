@@ -7,6 +7,13 @@ Zuverlässigkeit.
   (vorher wurden Fehler beim Löschen/Anlegen von Kapiteln still verschluckt und als Erfolg verbucht)
 - Upload wird geprüft: Der Tonie wird danach neu abgerufen, erst wenn genau die neuen Kapitel drauf sind, gilt er als bespielt
 - Erst alle Dateien hochladen, dann die Kapitel ersetzen – bricht der Upload ab, bleibt der alte Inhalt auf dem Tonie
+- Tausch in **einem** Schritt (`PATCH chapters=[…]`, am echten Konto getestet); lehnt die Cloud das ab, werden die
+  Kapitel wie bisher einzeln ersetzt
+- Vor jedem Tausch wird die bisherige Kapitelliste gesichert (`/data/sicherung/`, die letzten 10 je Tonie).
+  Schlägt Tausch oder Prüfung fehl, spielt die App den alten Inhalt automatisch zurück – der Tonie bleibt nie leer
+  oder halb bespielt
+- Die Prüfung wartet, bis die Cloud mit dem Umwandeln fertig ist (`UMWANDLUNG_WARTEN`, Standard 180 s), und
+  erkennt Umwandlungsfehler (`transcodingErrors`)
 - Folgen, die 3-mal beim Hochladen scheitern, werden ausgesetzt (`MAX_FEHLVERSUCHE`); Anmelde-/Abruffehler zählen nicht
 - Kurzer Cloud-Ausfall markiert keine Tonies mehr als „nicht mehr im Konto“
 - Uhrzeit wird beim Speichern geprüft; eine kaputte gespeicherte Uhrzeit wird auf 17:30 gesetzt statt den Planer
